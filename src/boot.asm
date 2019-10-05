@@ -28,15 +28,26 @@ STC     MACR
         ORCC #%00000001
         ENDM
 
+; clear carry flag
+CLZ     MACR
+        ANDCC #%11111011
+        ENDM 
+
+; set carry flag
+STZ     MACR
+        ORCC #%00000100
+        ENDM
+
 ; ==================================================
 ; SYSTEM CONSTANTS
 ; ==================================================
 
 RAMSTART  EQU $0000     ; lowest RAM location
 RAMEND    EQU $E000     ; highest RAM location
-STACK     EQU $DEFF     ; initial stack pointer
+STACK     EQU $DEF0     ; initial stack pointer
 
 LINEPTR   EQU $DF00     ; pointer to 256 char line buffer
+HEXADDR   EQU $DEFC     ; 4-digit hex number
 
 ; ==================================================
 ; UART ADDRESSES
@@ -190,17 +201,241 @@ BACKSPACE:
     JMP NEXTCHAR
 
 LINEDONE:
-    ;LDA #10
-    ;JSR OUTCHAR
-    ;LDA #13
-    ;JSR OUTCHAR
     PULS X
+    RTS
+
+; ==================================================    
+; COMMAND INTERPRETER
+; ==================================================  
+
+CMDINT:
+    LDX #PROMPT         ; show the prompt
+    JSR PRINTSTRING
+
+    JSR GETLINE         ; get user input
+    
+    LDA #10
+    JSR OUTCHAR
+    LDA #13
+    JSR OUTCHAR
+
+    LDX #LINEPTR
+
+CMDNEXTCHAR:
+    CMPB #0             ; no more chars left?
+    BEQ CMDINT
+    LDA ,X+
+    DECB
+    CMPA #' '
+    BEQ CMDNEXTCHAR     ; skip spaces
+    CMPA #'M'           ; memory <addr> command
+    BEQ CMD_MEMDUMP
+    CMPA #'R'           ; run <addr> command
+    BEQ CMD_RUN
+
+    ; command not accepted
+    LDX #HUH
+    JSR PRINTSTRING
+    JMP CMDINT    
+
+CMD_MEMDUMP:
+    JSR PARSEHEXADDR
+    BNE CMD_EXIT1       ; error parsing HEX address
+
+    LDB #16
+    LDX HEXADDR
+
+MEMNXTLINE:
+    ; display HEX address
+    LDA HEXADDR
+    JSR WRITEHEX
+    LDA HEXADDR+1
+    JSR WRITEHEX
+
+MEMNXTBYTE:
+    ; space
+    LDA #32
+    JSR OUTCHAR
+
+    LDA ,X+
+    JSR WRITEHEX
+    DECB
+    BNE MEMNXTBYTE
+
+    LDA #10         ; next line on console
+    JSR OUTCHAR
+    LDA #13
+    JSR OUTCHAR
+
+    STX HEXADDR     ; update hex address for next line
+    LDB #16
+
+    ; if user presses space, continue
+    ; otherwise exit
+    JSR INCHAR
+    CMPA #32        ; space!
+    BEQ MEMNXTLINE
+
+CMD_EXIT1:    
+    JMP CMDINT
+
+CMD_RUN:
+    JSR PARSEHEXADDR    ; get HEX jump address
+    BNE CMDINT
+    JMP [HEXADDR]
+
+PROMPT  .ascii "> "
+        .db 0
+
+HUH .ascii "?"
+    .db 10,13,0
+
+; ==================================================    
+;   PARSE ASCII HEX ADDRESS (X) INTO 'HEXADDR'
+;
+;   Decrements B by number of chars read
+;   Increments X by number of chars read
+;
+;   Sets zero flag to 1 if ok, else error
+; ==================================================  
+
+PARSEHEXADDR:
+    CMPB #0             ; no more chars left?
+    BEQ PSHEXERR
+    LDA ,X+
+    DECB
+    CMPA #' '
+    BEQ PARSEHEXADDR    ; skip spaces
+
+    JSR INITHEX
+
+    ; read hex address (digit 1)
+    JSR GETHEX          ; put hex digit in D register
+    BNE PSHEXERR        ; check if we got a HEX character
+                        ; if not, it's not a valid address
+
+    ; read hex address (digit 2)
+    LDA ,X+
+    DECB
+    BMI PSHEXOK
+    JSR GETHEX          
+    BNE PSHEXOK         ; 2nd hex character does not exist
+                        ; it might be a valid address
+
+    ; read hex address (digit 3)
+    LDA ,X+
+    DECB
+    BMI PSHEXOK
+    JSR GETHEX
+    BNE PSHEXOK         ; 3rd hex character does not exist
+                        ; it might be a valid address
+
+    ; read hex address (digit 4)
+    LDA ,X+
+    DECB
+    BMI PSHEXOK
+    JSR GETHEX
+
+PSHEXOK:
+    STZ    
+    RTS
+
+PSHEXERR:
+    CLZ
+    RTS
+
+; =============================================================================
+;   PARSE HEX DIGIT IN A REGISTER AND SHIFT IT INTO 'HEXADDR'
+; =============================================================================
+
+GETHEX:
+    CMPA #'0'
+    BLO GH_ERROR
+    CMPA #'9'
+    BHI GH_ALPHA    ; not numeric, might be alpha
+
+GH_OK:
+    LSL HEXADDR+1   ; shift 16-bit number at addr HEXADDR left x4
+    ROL HEXADDR
+    LSL HEXADDR+1
+    ROL HEXADDR
+    LSL HEXADDR+1
+    ROL HEXADDR
+    LSL HEXADDR+1
+    ROL HEXADDR
+    ANDA #%00001111 ; keep the lower nibble
+    ADDA HEXADDR+1
+    STA HEXADDR+1
+    JMP GH_EXIT
+
+GH_ALPHA:
+    CMPA #'A'
+    BLO GH_ERROR
+    CMPA #'F'
+    BHI GH_ERROR
+    SUBA #7         ; convert 'A'..'F' -> 10 .. 15
+    JMP GH_OK
+
+GH_ERROR:
+    CLZ             ; clear zero flag -> error
+    RTS
+
+GH_EXIT:
+    STZ             ; set zero flag -> ok
+    RTS
+
+; =============================================================================
+;   INITIALISE HEXADDR
+; =============================================================================
+INITHEX:
+    PSHS    B,X
+    CLRB
+    LDX     #HEXADDR
+    STB     ,X+
+    STB     0,X
+    PULS    B,X
+    RTS
+
+; =============================================================================
+;   WRITE CONTENTS OF A TO CONSOLE AS HEX NUMBER
+; =============================================================================
+WRITEHEX:
+    PSHS A,B
+    TFR A,B
+    LSRA
+    LSRA
+    LSRA
+    LSRA
+    CMPA #9
+    BHI WH_ALPHA
+    ADDA #48
+    JSR OUTCHAR
+    JMP WH_DIGIT2
+
+WH_ALPHA:
+    ADDA #55
+    JSR OUTCHAR
+
+WH_DIGIT2:
+    TFR B,A
+    ANDA #%00001111
+    CMPA #9
+    BHI WH_ALPHA2
+    ADDA #48
+    JSR OUTCHAR
+    JMP WH_EXIT
+
+WH_ALPHA2:
+    ADDA #55
+    JSR OUTCHAR
+
+WH_EXIT:
+    PULS A,B
     RTS
 
 ; =============================================================================
 ;   ENTRY POINT
 ; =============================================================================
-
     
 START:
     ORCC #%01010000 ; disable interrupts
@@ -259,26 +494,11 @@ START:
     JSR PRINTSTRING 
 
 DO_PROMPT:
-    LDX #PROMPT
-    JSR PRINTSTRING
-
-    ; get user input
-    JSR GETLINE
-
-    LDA #10
-    JSR OUTCHAR
-    LDA #13
-    JSR OUTCHAR
-
-    ; interpret user input
-
-    JMP DO_PROMPT
+    JMP CMDINT
 
 SIGNON  .ascii "HD6309 Computer bootrom version 1.0"
         .db 10,13,0
 
-PROMPT  .ascii "> "
-        .db 0
 ; ==================================================    
 ; INTERRUPT SERVICE ROUTINE INDIRECTIONS
 ; ==================================================    
