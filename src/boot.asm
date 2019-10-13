@@ -47,7 +47,10 @@ RAMEND    EQU $E000     ; highest RAM location
 STACK     EQU $DEF0     ; initial stack pointer
 
 LINEPTR   EQU $DF00     ; pointer to 256 char line buffer
-HEXADDR   EQU $DEFC     ; 4-digit hex number
+HEXADDR   EQU $DEFB     ; 4-digit hex number
+SRECCHK   EQU $0000     ; 8 bits
+SRECERR   EQU $0001     ; 8 bits
+SRECTMP   EQU $0002     ; 8 bits
 
 ; ==================================================
 ; UART ADDRESSES
@@ -143,6 +146,46 @@ INCHAR_1:
     RTS
 
 ; ==================================================    
+; GET A CHARACTER FROM THE TERMINAL WITH ECHO
+;
+;   DESTROYS: FLAGS
+;
+;   RETURNS: CHAR IN A
+;
+;   BLOCKS ON UART EMPTY
+; ================================================== 
+
+INCHARE:
+    JSR INCHAR
+    JSR OUTCHAR
+    RTS
+
+; ==================================================
+; GET A CHARACTER FROM THE CONSOLE AND ECHO IT
+; TO THE OUTPUT
+;
+; BLOCKS ON UART RX EMPTY
+; ================================================== 
+
+INCHARECHO:
+    JSR INCHAR
+    JSR OUTCHAR
+    RTS
+
+; ==================================================
+; CHECK IF A CHARACTER IS AVAILABLE
+; SETS NE CONDITION IF CHAR IS AVAILABLE
+; ==================================================    
+
+INCHECK:
+    PSHS B
+    LDB SER_LSR
+    BITB #1    
+    PULS B
+    RTS
+
+
+; ==================================================    
 ; GET A LINE FROM THE TERMINAL WITH ECHO
 ;
 ;   ESCAPE clears the entire line
@@ -232,6 +275,8 @@ CMDNEXTCHAR:
     BEQ CMD_MEMDUMP
     CMPA #'R'           ; run <addr> command
     BEQ CMD_RUN
+    CMPA #'L'           ; Load SREC
+    BEQ CMD_SREC
 
     ; command not accepted
     LDX #HUH
@@ -284,20 +329,190 @@ CMD_RUN:
     BNE CMDINT
     JMP [HEXADDR]
 
+CMD_SREC:
+    LDX #SRECTXT
+    JSR PRINTSTRING
+    JMP SRECLOADER
+
 PROMPT  .ascii "> "
         .db 0
 
 HUH .ascii "?"
     .db 10,13,0
 
+SRECTXT .ascii "Expecting SREC"
+        .db 10,13,0
+
 ; ==================================================    
+; SRECORD LOADER
+;   https://en.wikipedia.org/wiki/SREC_(file_format)
+; SUPPORTS
+;   S0 - dumps to the terminal (not implemented)
+;   S1 - 16-bit address data record
+;   S9 - 16-bit start address
+;
+; Inspired by Alan Garfield's loader
+; https://github.com/alangarf/amx_axc_m68k/blob/master/loader.s#L206
+; ================================================== 
+SRECLOADER:
+    JSR  INCHAR     ; get character
+    CMPA #'S'       ; is it an S record?
+    BNE  SRECLOADER ; skip, if it isnt
+    
+    JSR  INCHAR     ; get next char
+    CMPA #'1'       ; is it an S5 count
+    BEQ  _LD_S1    
+    CMPA #'9'       ; is it an S9 termination record?
+    BEQ  _LD_S9
+    JMP  SRECLOADER
+    
+_LD_S1:
+    CLRB
+    STB  SRECCHK    ; clear checksum
+    STB  SRECERR    ; clear error flag
+    JSR  SRECREAD   ; get S1 packet length
+    SUBA #3         ; calculate number of payload bytes
+    PSHS A          ; save the count
+    JSR  SRECREAD   ; load MSB of address
+    TFR  A,B        ; 
+    JSR  SRECREAD   ; load LSB of address
+    EXG  A,B        ; D = [MSB, LSB]
+    TFR  D,X        ; X = load address
+    PULS B          ; B = byte count
+    JMP  _LD_DATA
+    
+_LD_S9:
+    CLRB
+    STB  SRECCHK    ; clear checksum
+    JSR  SRECREAD   ; get S9 packet length
+    JSR  SRECREAD   ; load MSB of address
+    TFR  A,B        ; 
+    JSR  SRECREAD   ; load LSB of address
+    EXG  A,B        ; D = [MSB, LSB]
+    STD  HEXADDR    ; store jump address
+    JSR SRECREAD    ; read checksum byte
+    LDB SRECCHK
+    INCB            ; adjust for 1s complement!
+    BEQ _LD_OK      ; total sum should be zero
+    LDA #$FF
+    STA SRECERR     ; set error flag    
+_LD_OK:
+    JMP _LD_TERM
+
+; Load data part of packet
+; expects B to have the number of
+; bytes to read. Data is stored
+; using the X index register
+_LD_DATA:    
+    JSR SRECREAD
+    STA ,X+
+    DECB
+    BNE _LD_DATA    ; loop until there is no more data to read
+    JSR SRECREAD    ; read checksum byte
+    LDB SRECCHK
+    INCB            ; adjust for 1s complement!
+    BEQ _LD_DATA_OK ; total sum should be zero
+    LDA #'X'        ; print X for every bad record
+    JSR OUTCHAR
+    LDA #$FF
+    STA SRECERR     ; set error flag
+    JMP SRECLOADER  ; try again .. 
+
+_LD_DATA_OK:
+    LDA #'*'        ; print * for every good record
+    JSR OUTCHAR
+    JMP SRECLOADER  ; next record .. 
+    
+; Check for errors
+_LD_TERM:
+    LDA SRECERR         ; load error flags
+    BEQ _LD_NOERRORS    
+    LDX #SRECERRORSTR    ; report error
+    JSR PRINTSTRING
+    JMP SRECLOADER      ; try again..
+_LD_NOERRORS:
+    LDX #ADDRSTR
+    JSR PRINTSTRING
+    LDA HEXADDR
+    JSR WRITEHEX
+    LDA HEXADDR+1
+    JSR WRITEHEX
+    LDX #EOLSTR
+    JSR PRINTSTRING
+    JMP [HEXADDR]       ; jump to start address
+    
+SRECERRORSTR:
+        .db 13,10
+        .ascii "SREC checksum errors! Aborting."
+EOLSTR:        
+        .db 13,10,0
+
+ADDRSTR:
+        .db 13,10
+        .ascii "Jumping to $"
+        .db 0
+
+; ========================================
+;   SREC LOADER
+;   READ BYTE AS ASCII HEX DIGIT
+;
+;   return contents in A, update checksum
+; ========================================
+SRECREAD:
+    PSHS B
+    CLRA
+    JSR  READHEXDIGIT
+    LSLA
+    LSLA
+    LSLA
+    LSLA
+    JSR  READHEXDIGIT
+    ; update checksum
+    TFR  A,B
+    ADDB SRECCHK
+    STB  SRECCHK
+    PULS B
+    RTS
+
+; ========================================
+;   SREC LOADER - READ HEX DIGIT
+;
+; read an ASCII hex digit 0-9,A-F from
+; the UART, convert to 4-bit binary
+; and OR it with the contents in A.
+; ========================================
+READHEXDIGIT:
+    PSHS B
+    PSHS A          ; save A for later    
+    JSR INCHAR
+    SUBA #'0'       ; move ascii 0 down to binary 0
+    BMI READHEX_ERR
+    CMPA #9
+    BLE READHEX_OK  ; 0-9 found
+    SUBA #7         ; drop 'A' down to 10
+    CMPA #$F
+    BLE READHEX_OK
+    
+READHEX_ERR:
+    PULS A
+    PULS B
+    RTS
+
+READHEX_OK:
+    STA SRECTMP     ; store 4-bit value in temp
+    PULS A          ; restore old value
+    ORA SRECTMP     ; or the hex value
+    PULS B
+    RTS
+
+; ==================================================
 ;   PARSE ASCII HEX ADDRESS (X) INTO 'HEXADDR'
 ;
 ;   Decrements B by number of chars read
 ;   Increments X by number of chars read
 ;
 ;   Sets zero flag to 1 if ok, else error
-; ==================================================  
+; ==================================================
 
 PARSEHEXADDR:
     CMPB #0             ; no more chars left?
@@ -345,7 +560,7 @@ PSHEXERR:
     RTS
 
 ; =============================================================================
-;   PARSE HEX DIGIT IN A REGISTER AND SHIFT IT INTO 'HEXADDR'
+;   PARSE HEX DIGIT IN A REGISTER AND SHIFT IT INTO 16-bit 'HEXADDR'
 ; =============================================================================
 
 GETHEX:
@@ -498,6 +713,20 @@ DO_PROMPT:
 
 SIGNON  .ascii "HD6309 Computer bootrom version 1.0"
         .db 10,13,0
+
+; ==================================================    
+; ROM ROUTINE JUMP TABLE
+; ==================================================    
+
+    ORG $FFA0
+    .dw CMDINT    
+    .dw INCHAR
+    .dw INCHARE
+    .dw INCHECK
+    .dw OUTCHAR
+    .dw PRINTSTRING
+    .dw WRITEHEX
+
 
 ; ==================================================    
 ; INTERRUPT SERVICE ROUTINE INDIRECTIONS

@@ -6,7 +6,7 @@ The 4k ROM lives from 0xF000 to 0xFFFF in the HD6309 address space.
 
 The source code is meant to be compiled with the LWASM assembler.
 
-# Commands
+# Monitor commands
 
-'Mxxxx' : dump memory at address xxxx.
-'Rxxxx' : jump to address xxxx and run.
+* M XXXX - show memory at HEX address XXXX.
+* R XXXX - jump to HEX address XXXX and run.
