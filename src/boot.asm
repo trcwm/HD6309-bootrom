@@ -277,6 +277,10 @@ CMDNEXTCHAR:
     BEQ CMD_RUN
     CMPA #'L'           ; Load SREC
     BEQ CMD_SREC
+    CMPA #'B'           ; boot OS from disk
+    BNE NOT_BOOT
+    JMP BOOTOS
+NOT_BOOT:
 
     ; command not accepted
     LDX #HUH
@@ -647,6 +651,49 @@ WH_ALPHA2:
 WH_EXIT:
     PULS A,B
     RTS
+
+; ==================================================    
+; READ SECTOR 1 INTO $B800 AND JUMP TO IT
+;
+; note: this only works in simulator, not real
+;       HD6309 hardware because we don't have 
+;       actual SD card hardware yet.
+; ==================================================    
+
+; FAKE DRIVER EQUATES
+REG_CMD         EQU $E020       ; command register (write = perform action)
+REG_DATA        EQU $E021       ; data register
+REG_DRIVESEL    EQU $E022       ; drive select
+REG_TRACK       EQU $E023       ; track
+REG_SECTOR      EQU $E024       ; sector
+
+CMD_READSECTOR  EQU 1
+CMD_WRITESECTOR EQU 2
+CMD_SEEKSECTOR  EQU 3
+
+BOOTADDR EQU $B800
+
+BOOTING .ascii "Booting.."
+        .db 10,13,0
+
+BOOTOS:
+    LDX #BOOTING
+    JSR PRINTSTRING
+    CLRA
+    STA REG_DRIVESEL            ; select disk 0
+    STA REG_TRACK               ; track 0
+    INCA
+    STA REG_SECTOR              ; sector 1
+    LDA #CMD_READSECTOR         ; read the sector from disk
+    STA REG_CMD
+    LDX #BOOTADDR               ; load address
+    CLRB
+BOOTOS_LD1:
+    LDA REG_DATA
+    STA ,X+                     ; store byte
+    DECB
+    BNE BOOTOS_LD1
+    JMP BOOTADDR
 
 ; =============================================================================
 ;   ENTRY POINT
